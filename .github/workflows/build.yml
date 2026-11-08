@@ -1,0 +1,925 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source files
+        run: |
+          mkdir -p src/mod scripts config
+          cat > CMakeLists.txt <<'SRCEOF'
+          cmake_minimum_required(VERSION 3.22)
+
+          project(levilauncher_android_mod_template LANGUAGES CXX)
+
+          set(CMAKE_CXX_STANDARD 20)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          set(CMAKE_CXX_EXTENSIONS OFF)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+          set(MOD_ID "better_hitreg" CACHE STRING "LeviLauncher mod package directory name")
+          set(MOD_NAME "Better Hitreg" CACHE STRING "LeviLauncher mod display name")
+          set(MOD_AUTHOR "you" CACHE STRING "LeviLauncher mod author")
+          set(MOD_VERSION "0.1.0" CACHE STRING "LeviLauncher mod version")
+          set(MOD_LIBRARY_NAME "better_hitreg" CACHE STRING "Native library name without lib prefix or .so suffix")
+          set(MOD_MINECRAFT_VERSIONS "[\"1.26.62.1\", \"1.26.62\"]" CACHE STRING "Raw JSON array for manifest minecraft_versions")
+          set(MOD_ICON "" CACHE STRING "Optional package-relative icon path, such as icon.png")
+
+          include(FetchContent)
+
+          FetchContent_Declare(
+              preloader_android
+              GIT_REPOSITORY https://github.com/LiteLDev/preloader-android.git
+              GIT_TAG 0.2.2
+              SOURCE_SUBDIR cmake/preloader-sdk
+          )
+          FetchContent_Declare(
+              nlohmann_json
+              GIT_REPOSITORY https://github.com/nlohmann/json.git
+              GIT_TAG v3.11.3
+          )
+          FetchContent_Declare(
+              boost_pfr
+              GIT_REPOSITORY https://github.com/boostorg/pfr.git
+              GIT_TAG boost-1.88.0
+          )
+          FetchContent_Declare(
+              magic_enum
+              GIT_REPOSITORY https://github.com/Neargye/magic_enum.git
+              GIT_TAG v0.9.7
+          )
+          FetchContent_Declare(
+              fmt
+              GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+              GIT_TAG 11.2.0
+          )
+          set(FMT_DOC OFF CACHE BOOL "Disable fmt docs" FORCE)
+          set(FMT_TEST OFF CACHE BOOL "Disable fmt tests" FORCE)
+          set(FMT_INSTALL OFF CACHE BOOL "Disable fmt install rules" FORCE)
+          FetchContent_MakeAvailable(preloader_android nlohmann_json boost_pfr magic_enum fmt)
+
+          # The launcher's runtime reads an extra ModuleInfo member (onKeybind) that the
+          # pinned SDK header does not have. Without this patch registerModule() reads
+          # past the end of the struct and crashes the game.
+          find_program(LEVI_PYTHON NAMES python3 python)
+          if(NOT LEVI_PYTHON)
+              message(FATAL_ERROR "python3 is required to patch the preloader SDK header")
+          endif()
+          execute_process(
+              COMMAND "${LEVI_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_sdk.py" "${preloader_android_SOURCE_DIR}"
+              RESULT_VARIABLE LEVI_SDK_PATCH_RESULT
+          )
+          if(NOT LEVI_SDK_PATCH_RESULT EQUAL 0)
+              message(FATAL_ERROR "Patching the preloader SDK header failed (see output above)")
+          endif()
+
+          FetchContent_GetProperties(preloader_android)
+          set(LEVI_PRELOADER_INCLUDE_DIR "${preloader_android_SOURCE_DIR}/include")
+
+          if(NOT ANDROID)
+              set(LEVI_GENERATED_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated-config")
+
+              add_executable(levi_config_generator
+                  src/config_generator.cpp
+                  src/mod/Config.cpp
+              )
+
+              target_include_directories(levi_config_generator
+                  PRIVATE
+                      src
+                      "${LEVI_PRELOADER_INCLUDE_DIR}"
+              )
+
+              target_compile_definitions(levi_config_generator PRIVATE PL_CONFIG_NO_RUNTIME)
+              target_link_libraries(levi_config_generator PRIVATE
+                  nlohmann_json::nlohmann_json
+                  Boost::pfr
+                  magic_enum::magic_enum
+              )
+
+              add_custom_target(levi_generate_config
+                  COMMAND levi_config_generator "${LEVI_GENERATED_CONFIG_DIR}"
+                  DEPENDS levi_config_generator
+                  COMMENT "Generating config.json and config.schema.json"
+                  VERBATIM
+              )
+
+              return()
+          endif()
+
+          if(NOT DEFINED LEVI_PACKAGE_CONFIG_DIR)
+              set(LEVI_PACKAGE_CONFIG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/config" CACHE PATH
+                  "Directory containing config.json and config.schema.json to package")
+          endif()
+
+          get_filename_component(LEVI_PACKAGE_CONFIG_DIR "${LEVI_PACKAGE_CONFIG_DIR}" ABSOLUTE)
+          set(LEVI_PACKAGE_CONFIG_JSON "${LEVI_PACKAGE_CONFIG_DIR}/config.json")
+          set(LEVI_PACKAGE_CONFIG_SCHEMA "${LEVI_PACKAGE_CONFIG_DIR}/config.schema.json")
+
+          if(NOT IS_DIRECTORY "${LEVI_PACKAGE_CONFIG_DIR}")
+              message(FATAL_ERROR "LEVI_PACKAGE_CONFIG_DIR must be a directory: ${LEVI_PACKAGE_CONFIG_DIR}")
+          endif()
+
+          if(NOT EXISTS "${LEVI_PACKAGE_CONFIG_JSON}")
+              message(FATAL_ERROR "LEVI_PACKAGE_CONFIG_DIR must contain config.json: ${LEVI_PACKAGE_CONFIG_JSON}")
+          endif()
+
+          if(NOT EXISTS "${LEVI_PACKAGE_CONFIG_SCHEMA}")
+              message(FATAL_ERROR "LEVI_PACKAGE_CONFIG_DIR must contain config.schema.json: ${LEVI_PACKAGE_CONFIG_SCHEMA}")
+          endif()
+
+          if(NOT CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a" AND
+             NOT CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")
+              message(FATAL_ERROR "Unsupported Android ABI: ${CMAKE_ANDROID_ARCH_ABI}")
+          endif()
+
+          option(LEVI_LINK_PRELOADER
+                 "Build and link the preloader target instead of leaving SDK symbols for runtime lookup"
+                 ON)
+
+          if(LEVI_LINK_PRELOADER AND NOT TARGET preloader)
+              add_subdirectory("${preloader_android_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/_preloader_android")
+          endif()
+
+          add_library(${MOD_LIBRARY_NAME} SHARED
+              src/main.cpp
+              src/mod/Config.cpp
+              src/mod/MyMod.cpp
+          )
+
+          set_target_properties(${MOD_LIBRARY_NAME} PROPERTIES
+              OUTPUT_NAME "${MOD_LIBRARY_NAME}"
+          )
+
+          target_include_directories(${MOD_LIBRARY_NAME}
+              PRIVATE
+                  src
+                  "${LEVI_PRELOADER_INCLUDE_DIR}"
+          )
+
+          target_compile_options(${MOD_LIBRARY_NAME}
+              PRIVATE
+                  $<$<COMPILE_LANG_AND_ID:CXX,Clang,GNU>:-fvisibility=hidden -fvisibility-inlines-hidden>
+          )
+
+          target_link_options(${MOD_LIBRARY_NAME}
+              PRIVATE
+                  "-Wl,-z,max-page-size=16384"
+          )
+
+          find_library(log-lib log REQUIRED)
+          target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE
+              ${log-lib}
+              nlohmann_json::nlohmann_json
+              Boost::pfr
+              magic_enum::magic_enum
+              fmt::fmt
+          )
+
+          if(TARGET preloader)
+              target_link_libraries(${MOD_LIBRARY_NAME} PRIVATE preloader)
+          else()
+              target_link_options(${MOD_LIBRARY_NAME} PRIVATE
+                  "-Wl,--unresolved-symbols=ignore-all")
+          endif()
+
+          if(NOT CMAKE_STRIP)
+              message(FATAL_ERROR "CMAKE_STRIP is required to strip the generated library.")
+          endif()
+
+          add_custom_command(TARGET ${MOD_LIBRARY_NAME} POST_BUILD
+              COMMAND "${CMAKE_STRIP}" --strip-unneeded "$<TARGET_FILE:${MOD_LIBRARY_NAME}>"
+              COMMENT "Stripping symbols from $<TARGET_FILE_NAME:${MOD_LIBRARY_NAME}>"
+              VERBATIM
+          )
+
+          configure_file(
+              "${CMAKE_CURRENT_SOURCE_DIR}/manifest.json.in"
+              "${CMAKE_CURRENT_BINARY_DIR}/manifest.json"
+              @ONLY
+          )
+
+          set(LEVI_PACKAGE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/package")
+          set(LEVI_PACKAGE_MOD_DIR "${LEVI_PACKAGE_ROOT}/${MOD_ID}")
+          set(LEVI_PACKAGE_FILE "${CMAKE_CURRENT_BINARY_DIR}/${MOD_ID}-${MOD_VERSION}-${CMAKE_ANDROID_ARCH_ABI}.levipack")
+          set(LEVI_PACKAGE_ICON_COMMAND)
+          set(LEVI_PACKAGE_CONFIG_COMMAND
+              COMMAND "${CMAKE_COMMAND}" -E copy_directory "${LEVI_PACKAGE_CONFIG_DIR}" "${LEVI_PACKAGE_MOD_DIR}/config")
+
+          if(NOT MOD_ICON STREQUAL "")
+              if(IS_ABSOLUTE "${MOD_ICON}")
+                  message(FATAL_ERROR "MOD_ICON must be a package-relative path")
+              endif()
+
+              if(MOD_ICON MATCHES "(^|/)\\.\\.(/|$)")
+                  message(FATAL_ERROR "MOD_ICON must not contain ..")
+              endif()
+
+              set(MOD_ICON_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/${MOD_ICON}")
+              if(NOT EXISTS "${MOD_ICON_SOURCE}")
+                  message(FATAL_ERROR "MOD_ICON does not exist: ${MOD_ICON_SOURCE}")
+              endif()
+
+              get_filename_component(MOD_ICON_DIR "${MOD_ICON}" DIRECTORY)
+              if(NOT MOD_ICON_DIR STREQUAL "")
+                  list(APPEND LEVI_PACKAGE_ICON_COMMAND
+                      COMMAND "${CMAKE_COMMAND}" -E make_directory "${LEVI_PACKAGE_MOD_DIR}/${MOD_ICON_DIR}")
+              endif()
+              list(APPEND LEVI_PACKAGE_ICON_COMMAND
+                  COMMAND "${CMAKE_COMMAND}" -E copy "${MOD_ICON_SOURCE}" "${LEVI_PACKAGE_MOD_DIR}/${MOD_ICON}")
+          endif()
+
+          add_custom_target(levi_package
+              COMMAND "${CMAKE_COMMAND}" -E rm -rf "${LEVI_PACKAGE_ROOT}"
+              COMMAND "${CMAKE_COMMAND}" -E make_directory "${LEVI_PACKAGE_MOD_DIR}"
+              COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:${MOD_LIBRARY_NAME}>" "${LEVI_PACKAGE_MOD_DIR}/lib${MOD_LIBRARY_NAME}.so"
+              COMMAND "${CMAKE_COMMAND}" -E copy "${CMAKE_CURRENT_BINARY_DIR}/manifest.json" "${LEVI_PACKAGE_MOD_DIR}/manifest.json"
+              ${LEVI_PACKAGE_ICON_COMMAND}
+              ${LEVI_PACKAGE_CONFIG_COMMAND}
+              COMMAND "${CMAKE_COMMAND}" -E chdir "${LEVI_PACKAGE_ROOT}" "${CMAKE_COMMAND}" -E tar "cf" "${LEVI_PACKAGE_FILE}" --format=zip "${MOD_ID}"
+              WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+              DEPENDS ${MOD_LIBRARY_NAME}
+              COMMENT "Packaging ${MOD_ID} for LeviLauncher"
+              VERBATIM
+          )
+          SRCEOF
+          cat > scripts/patch_sdk.py <<'SRCEOF'
+          #!/usr/bin/env python3
+          """Make the preloader SDK's ModuleInfo match the current LeviLauncher runtime.
+
+          SDK 0.2.2 ends ModuleInfo after onConfigChanged. Newer launchers also read an
+          onKeybind callback after it, which runs past the end of the old struct and
+          crashes inside pl::modmenu::registerModule. This appends the missing member
+          (empty = no callback) plus zeroed padding so extra trailing fields read as empty.
+          """
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          headers = sorted(root.rglob("ModMenu.hpp"))
+          if not headers:
+              print(f"patch_sdk: ModMenu.hpp not found under {root}")
+              sys.exit(1)
+
+          path = headers[0]
+          text = path.read_text(encoding="utf-8")
+
+          if "onKeybind" in text:
+              print(f"patch_sdk: {path} already has onKeybind, nothing to do")
+              sys.exit(0)
+
+          member = re.compile(
+              r"(?:std::function<[^;{}]*?>|[\w:]+)\s+onConfigChanged\s*(?:\{\s*\}|=[^;]*)?;"
+          )
+          m = member.search(text)
+          if not m:
+              print(f"patch_sdk: could not find the onConfigChanged member in {path}")
+              for i, line in enumerate(text.splitlines(), 1):
+                  if "onConfigChanged" in line or "struct ModuleInfo" in line:
+                      print(f"  line {i}: {line}")
+              sys.exit(1)
+
+          addition = (
+              "\n    std::function<void()> onKeybind{};"
+              "\n    unsigned char abiTailPadding_[128]{};"
+          )
+          text = text[: m.end()] + addition + text[m.end():]
+          path.write_text(text, encoding="utf-8")
+          print(f"patch_sdk: patched {path}")
+          start = text.rfind("struct ModuleInfo", 0, m.end())
+          print(text[start : m.end() + len(addition) + 20] if start != -1 else "(struct not located)")
+          SRCEOF
+          cat > src/config_generator.cpp <<'SRCEOF'
+          #include "mod/Config.h"
+
+          #include <filesystem>
+          #include <fstream>
+          #include <iostream>
+
+          namespace {
+
+          bool writeJson(const std::filesystem::path &path, const nlohmann::json &value) {
+              std::error_code ec;
+              std::filesystem::create_directories(path.parent_path(), ec);
+              if (ec) {
+                  std::cerr << "Failed to create " << path.parent_path() << ": " << ec.message() << '\n';
+                  return false;
+              }
+
+              std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+              if (!stream) {
+                  std::cerr << "Failed to open " << path << '\n';
+                  return false;
+              }
+
+              stream << value.dump(2) << '\n';
+              return stream.good();
+          }
+
+          } // namespace
+
+          int main(int argc, char **argv) {
+              if (argc != 2) {
+                  std::cerr << "Usage: levi_config_generator <output-config-dir>\n";
+                  return 2;
+              }
+
+              const std::filesystem::path outputDir = argv[1];
+              if (!writeJson(outputDir / "config.json", clange_me::makeDefaultConfigJson()))
+                  return 1;
+              if (!writeJson(outputDir / "config.schema.json", clange_me::makeConfigSchemaJson()))
+                  return 1;
+
+              return 0;
+          }
+          SRCEOF
+          cat > src/main.cpp <<'SRCEOF'
+          #include "mod/MyMod.h"
+
+          #include <pl/Mod.hpp>
+
+          PL_REGISTER_MOD(clange_me::ClangeMeMod, clange_me::ClangeMeMod::instance());
+          SRCEOF
+          cat > src/mod/Config.h <<'SRCEOF'
+          #pragma once
+
+          #include <string>
+          #include <string_view>
+
+          #include <pl/Config.hpp>
+
+          namespace clange_me {
+
+          // Settings loosely mirror the Java BetterHitreg mod (sound muffle/sharpen, toggles).
+          struct ModConfig {
+              int version = 1;
+              bool enabled = true;
+              bool hitSound = true;
+              bool hitFlash = true;
+              int hitVolume = 100;    // 0-100
+              int muffleAmount = 0;   // 0-100
+              int sharpenAmount = 0;  // 0-100
+              // Log-only helper: records sounds played right after you hit something
+              // into sound_samples.txt (used to learn the game's sound call).
+              bool soundSampler = true;
+              // Where to find GameMode::attack in libminecraftpe.so (1.26.62).
+              // Fill ONE of these. Signature = byte pattern with ?? wildcards.
+              // Rva = hex offset from the module base, e.g. "0x1234567".
+              std::string attackSignature = "";
+              std::string attackRva = "";
+          };
+
+          nlohmann::json makeDefaultConfigJson();
+          nlohmann::json makeConfigSchemaJson();
+
+          } // namespace clange_me
+
+          template <> struct pl::config::Schema<clange_me::ModConfig> {
+              static constexpr std::string_view title = "Better Hitreg Config";
+              static constexpr std::string_view description = {};
+
+              static constexpr FieldSchema field(std::string_view name) {
+                  if (name == "version")
+                      return {.title = "Version", .readOnly = true};
+                  if (name == "enabled")
+                      return {.title = "Enabled", .description = "Turns the mod on or off."};
+                  if (name == "hitSound")
+                      return {.title = "Instant hit sound", .description = "Play hit feedback immediately on swing."};
+                  if (name == "hitFlash")
+                      return {.title = "Instant hit flash", .description = "Show damage flash immediately on swing."};
+                  if (name == "hitVolume")
+                      return {.title = "Hit volume", .description = "0-100."};
+                  if (name == "muffleAmount")
+                      return {.title = "Muffle amount", .description = "0-100."};
+                  if (name == "sharpenAmount")
+                      return {.title = "Sharpen amount", .description = "0-100."};
+                  if (name == "soundSampler")
+                      return {.title = "Sound sampler", .description = "Write sound_samples.txt (log only, no gameplay change)."};
+                  if (name == "attackSignature")
+                      return {.title = "Attack signature", .description = "Byte pattern for the attack function."};
+                  if (name == "attackRva")
+                      return {.title = "Attack RVA", .description = "Hex offset of the attack function, e.g. 0x1234567."};
+                  return {};
+              }
+          };
+          SRCEOF
+          cat > src/mod/Config.cpp <<'SRCEOF'
+          #include "mod/Config.h"
+
+          namespace clange_me {
+
+          nlohmann::json makeDefaultConfigJson() { return pl::config::defaultJson(ModConfig{}); }
+
+          nlohmann::json makeConfigSchemaJson() { return pl::config::schema(ModConfig{}); }
+
+          } // namespace clange_me
+          SRCEOF
+          cat > src/mod/MyMod.h <<'SRCEOF'
+          #pragma once
+
+          #include <atomic>
+          #include <chrono>
+          #include <cstdint>
+          #include <optional>
+
+          #include "mod/Config.h"
+
+          #include <pl/Mod.hpp>
+          #include <pl/memory/Hook.hpp>
+
+          namespace clange_me {
+
+          class ClangeMeMod {
+            public:
+              static ClangeMeMod &instance();
+
+              ClangeMeMod();
+
+              [[nodiscard]] ll::mod::NativeMod &getSelf() const { return mSelf; }
+
+              bool load();
+              bool enable();
+              bool disable();
+              bool unload();
+
+              // Crash-loop breaker: a ".pending" file is written before risky work and
+              // removed afterwards. If it is still there on the next start, that work
+              // crashed the game, so it is skipped (until the file is deleted or a new
+              // build changes the tag).
+              bool guardTripped(const char *name);
+              void guardSet(const char *name);
+              void guardClear(const char *name);
+
+              // Called from the attack hook (game thread).
+              void onAttackCall(bool isAttack);
+              // Called from the sound hook (log only).
+              void onSoundCall(void *self, const void *name, const float *pos, uint64_t a3, uint64_t a4,
+                               float volume, float pitch);
+
+            private:
+              uintptr_t resolveAttackTarget();
+              bool targetLooksValid(uintptr_t addr);
+              void reloadConfigIfDue();
+              void writeCalibrationFile(bool force);
+
+              pl::memory::HookHandle mAttackHook;
+              pl::memory::HookHandle mSoundHook;
+              ll::mod::NativeMod &mSelf;
+              ModConfig mConfig;
+              std::optional<pl::config::ConfigFile<ModConfig>> mConfigFile;
+
+              std::chrono::steady_clock::time_point mLastReload{};
+              std::chrono::steady_clock::time_point mLastWrite{};
+              std::atomic<uint32_t> mAttackCalls{0};
+              std::atomic<uint32_t> mOtherCalls{0};
+              std::atomic<int64_t> mLastAttackMs{-100000};
+              std::atomic<uint32_t> mSoundSamples{0};
+          };
+
+          } // namespace clange_me
+          SRCEOF
+          cat > src/mod/MyMod.cpp <<'SRCEOF'
+          #include "mod/MyMod.h"
+
+          #include <atomic>
+          #include <cstdlib>
+          #include <filesystem>
+          #include <fstream>
+          #include <string>
+          #include <string_view>
+
+          #include <link.h>
+
+          #include <pl/Mod.hpp>
+          #include <pl/ModMenu.hpp>
+          #include <pl/memory/Signature.hpp>
+
+          namespace clange_me {
+
+          namespace {
+
+          constexpr const char *kModuleId = "better_hitreg.main";
+
+          // Change this when the build changes so old crash markers stop applying.
+          constexpr const char *kGuardTag = "abi2-2026-11-08";
+
+          // Minecraft Bedrock 1.26.62.1 (libminecraftpe.so, arm64). Found through the
+          // GameMode vtable: slot 16 (attack) forwards to this shared sender with the
+          // 3rd argument set to 1; slot 15 (interact) has its own function.
+          // Offsets are version specific, so the first two instructions are checked
+          // before hooking (see targetLooksValid).
+          constexpr uintptr_t kRvaAttackSender = 0x1009d290;
+          constexpr uint32_t kExpectWord0 = 0xd10743ff; // sub sp, sp, #464
+          constexpr uint32_t kExpectWord1 = 0xa9187bfd; // stp x29, x30, [sp, #384]
+
+          // SoundEngine::play-style function (1.26.62.1): 2nd entry of the SoundEngine
+          // class table. Takes (this, std::string const& name, Vec3 const& pos, two
+          // more 64-bit values, float volume, float pitch) and returns a 64-bit handle.
+          // Only used for logging for now.
+          constexpr uintptr_t kRvaSoundPlay = 0xbce0498;
+          constexpr uint32_t kSoundWord0 = 0xd10343ff; // sub sp, sp, #208
+          constexpr uint32_t kSoundWord1 = 0x6d0823e9; // stp d9, d8, [sp, #128]
+
+          // Live settings: changed by the menu / config file, read by the hook.
+          std::atomic<bool> gEnabled{true};
+          std::atomic<bool> gHitSound{true};
+          std::atomic<bool> gHitFlash{true};
+          std::atomic<int> gHitVolume{100};
+          std::atomic<int> gMuffle{0};
+          std::atomic<int> gSharpen{0};
+
+          // Pass-through detour using 8 integer registers so it stays safe even if the
+          // real function takes fewer arguments.
+          using U = uint64_t;
+          using Fn8 = U (*)(U, U, U, U, U, U, U, U);
+          Fn8 gOriginal = nullptr;
+
+          std::atomic<int> gAttackFirstCalls{0};
+          std::atomic<int> gSoundFirstCalls{0};
+
+          U attackDetour(U a0, U a1, U a2, U a3, U a4, U a5, U a6, U a7) {
+              const bool first = gAttackFirstCalls.fetch_add(1) < 3;
+              if (first)
+                  ClangeMeMod::instance().guardSet("attack_hook.pending");
+              if (gEnabled.load()) {
+                  // a0 = GameMode*, a1 = target Actor*, a2 = flag (1 on the attack path),
+                  // a3 = hit position pointer.
+                  ClangeMeMod::instance().onAttackCall((a2 & 1U) != 0);
+                  // Instant hit feedback (sound / flash) belongs here once the matching
+                  // game functions are located; it would use gHitSound, gHitFlash,
+                  // gHitVolume, gMuffle and gSharpen.
+              }
+              const U result = gOriginal(a0, a1, a2, a3, a4, a5, a6, a7);
+              if (first)
+                  ClangeMeMod::instance().guardClear("attack_hook.pending");
+              return result;
+          }
+
+          using SoundPlayFn = U (*)(void *, const void *, const float *, U, U, float, float);
+          SoundPlayFn gSoundOriginal = nullptr;
+
+          U soundDetour(void *self, const void *name, const float *pos, U a3, U a4, float volume, float pitch) {
+              const bool first = gSoundFirstCalls.fetch_add(1) < 3;
+              if (first)
+                  ClangeMeMod::instance().guardSet("sound_hook.pending");
+              ClangeMeMod::instance().onSoundCall(self, name, pos, a3, a4, volume, pitch);
+              const U result = gSoundOriginal(self, name, pos, a3, a4, volume, pitch);
+              if (first)
+                  ClangeMeMod::instance().guardClear("sound_hook.pending");
+              return result;
+          }
+
+          // Reads a libc++ std::string (short or long form) without owning it.
+          std::string readLibcxxString(const void *p) {
+              if (!p)
+                  return {};
+              const auto *b = static_cast<const unsigned char *>(p);
+              if (b[0] & 1U) {
+                  size_t len = *reinterpret_cast<const size_t *>(b + 8);
+                  const char *data = *reinterpret_cast<const char *const *>(b + 16);
+                  if (!data || len > 200)
+                      return "<long>";
+                  return std::string(data, len);
+              }
+              size_t len = b[0] >> 1;
+              if (len > 22)
+                  return "<bad>";
+              return std::string(reinterpret_cast<const char *>(b + 1), len);
+          }
+
+          int64_t nowMs() {
+              return std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+          }
+
+          uintptr_t moduleBase(const char *name) {
+              struct Ctx {
+                  const char *name;
+                  uintptr_t base;
+              } ctx{name, 0};
+              dl_iterate_phdr(
+                  [](dl_phdr_info *info, size_t, void *data) -> int {
+                      auto *c = static_cast<Ctx *>(data);
+                      if (info->dlpi_name && std::string_view(info->dlpi_name).find(c->name) != std::string_view::npos) {
+                          c->base = info->dlpi_addr;
+                          return 1;
+                      }
+                      return 0;
+                  },
+                  &ctx);
+              return ctx.base;
+          }
+
+          void applyConfig(const ModConfig &c) {
+              gEnabled = c.enabled;
+              gHitSound = c.hitSound;
+              gHitFlash = c.hitFlash;
+              gHitVolume = c.hitVolume;
+              gMuffle = c.muffleAmount;
+              gSharpen = c.sharpenAmount;
+          }
+
+          void onModuleToggle(std::string_view, bool enabled) { gEnabled = enabled; }
+
+          bool parseBool(std::string_view v) { return v == "true" || v == "1" || v == "on"; }
+
+          int parseInt(std::string_view v, int fallback) {
+              try {
+                  return std::stoi(std::string(v));
+              } catch (...) {
+                  return fallback;
+              }
+          }
+
+          // Called by the launcher when a menu entry changes (moduleId, key, value).
+          void handleConfigChanged(std::string_view, std::string_view key, std::string_view value) {
+              if (key == "hitSound")
+                  gHitSound = parseBool(value);
+              else if (key == "hitFlash")
+                  gHitFlash = parseBool(value);
+              else if (key == "hitVolume")
+                  gHitVolume = parseInt(value, gHitVolume.load());
+              else if (key == "muffleAmount")
+                  gMuffle = parseInt(value, gMuffle.load());
+              else if (key == "sharpenAmount")
+                  gSharpen = parseInt(value, gSharpen.load());
+          }
+
+          // Attach the change callback only if this SDK's builder accepts one with this
+          // shape; otherwise leave the builder untouched.
+          template <class B> decltype(auto) withConfigCallback(B &&b) {
+              if constexpr (requires { std::forward<B>(b).onConfigChanged(&handleConfigChanged); })
+                  return std::forward<B>(b).onConfigChanged(&handleConfigChanged);
+              else
+                  return std::forward<B>(b);
+          }
+
+          } // namespace
+
+          uintptr_t ClangeMeMod::resolveAttackTarget() {
+              auto &log = getSelf().getLogger();
+              if (!mConfig.attackSignature.empty()) {
+                  uintptr_t addr = pl::memory::resolveSignature(mConfig.attackSignature, "libminecraftpe.so");
+                  if (addr == 0)
+                      log.warn("attackSignature did not match in libminecraftpe.so");
+                  return addr;
+              }
+              uintptr_t base = moduleBase("libminecraftpe.so");
+              if (base == 0) {
+                  log.warn("Could not find libminecraftpe.so base address");
+                  return 0;
+              }
+              uintptr_t rva = kRvaAttackSender;
+              if (!mConfig.attackRva.empty())
+                  rva = static_cast<uintptr_t>(std::strtoull(mConfig.attackRva.c_str(), nullptr, 16));
+              return base + rva;
+          }
+
+          bool ClangeMeMod::targetLooksValid(uintptr_t addr) {
+              // Only enforced for the built-in offset. A user-supplied signature or RVA
+              // is trusted as given.
+              if (!mConfig.attackSignature.empty() || !mConfig.attackRva.empty())
+                  return true;
+              const auto *w = reinterpret_cast<const uint32_t *>(addr);
+              return w[0] == kExpectWord0 && w[1] == kExpectWord1;
+          }
+
+          void ClangeMeMod::reloadConfigIfDue() {
+              auto now = std::chrono::steady_clock::now();
+              if (now - mLastReload < std::chrono::seconds(2))
+                  return;
+              mLastReload = now;
+              if (mConfigFile && mConfigFile->load()) {
+                  mConfig = mConfigFile->value();
+                  applyConfig(mConfig);
+              }
+          }
+
+          void ClangeMeMod::writeCalibrationFile(bool force) {
+              auto now = std::chrono::steady_clock::now();
+              if (!force && now - mLastWrite < std::chrono::seconds(1))
+                  return;
+              mLastWrite = now;
+              std::error_code ec;
+              std::ofstream out(getSelf().getDataDir() / "hit_calibration.txt", std::ios::trunc);
+              if (!out)
+                  return;
+              out << "attack_calls=" << mAttackCalls.load() << "\n"
+                  << "other_calls=" << mOtherCalls.load() << "\n"
+                  << "hook_rva=0x" << std::hex << kRvaAttackSender << "\n";
+          }
+
+          void ClangeMeMod::onSoundCall(void *self, const void *name, const float *pos, uint64_t a3,
+                                        uint64_t a4, float volume, float pitch) {
+              // Only sounds within 1.5 s after an attack call, at most 80 lines.
+              if (nowMs() - mLastAttackMs.load() > 1500 || mSoundSamples.load() >= 80)
+                  return;
+              ++mSoundSamples;
+              std::ofstream out(getSelf().getDataDir() / "sound_samples.txt", std::ios::app);
+              if (!out)
+                  return;
+              out << "name=" << readLibcxxString(name) << " engine=0x" << std::hex
+                  << reinterpret_cast<uintptr_t>(self) << " a3=0x" << a3 << " a4=0x" << a4 << std::dec
+                  << " vol=" << volume << " pitch=" << pitch;
+              if (pos)
+                  out << " pos=" << pos[0] << "," << pos[1] << "," << pos[2];
+              out << " ms_since_attack=" << (nowMs() - mLastAttackMs.load()) << "\n";
+          }
+
+          void ClangeMeMod::onAttackCall(bool isAttack) {
+              if (isAttack) {
+                  mLastAttackMs = nowMs();
+                  ++mAttackCalls;
+              } else {
+                  ++mOtherCalls;
+              }
+              reloadConfigIfDue();
+              writeCalibrationFile(false);
+          }
+
+          bool ClangeMeMod::guardTripped(const char *name) {
+              std::ifstream in(getSelf().getDataDir() / name);
+              if (!in)
+                  return false;
+              std::string content;
+              std::getline(in, content);
+              return content == kGuardTag;
+          }
+
+          void ClangeMeMod::guardSet(const char *name) {
+              std::ofstream out(getSelf().getDataDir() / name, std::ios::trunc);
+              if (out)
+                  out << kGuardTag << "\n";
+          }
+
+          void ClangeMeMod::guardClear(const char *name) {
+              std::error_code ec;
+              std::filesystem::remove(getSelf().getDataDir() / name, ec);
+          }
+
+          ClangeMeMod &ClangeMeMod::instance() {
+              static ClangeMeMod instance;
+              return instance;
+          }
+
+          ClangeMeMod::ClangeMeMod() : mSelf(*ll::mod::NativeMod::current()) {}
+
+          bool ClangeMeMod::load() {
+              auto &self = getSelf();
+              self.getLogger().debug("Loading...");
+
+              std::error_code ec;
+              std::filesystem::create_directories(self.getDataDir(), ec);
+              if (ec) {
+                  self.getLogger().error("Failed to create data directory {}: {}", self.getDataDir().string(),
+                                         ec.message());
+                  return false;
+              }
+
+              std::filesystem::create_directories(self.getConfigDir(), ec);
+              if (ec) {
+                  self.getLogger().error("Failed to create config directory {}: {}",
+                                         self.getConfigDir().string(), ec.message());
+                  return false;
+              }
+
+              mConfigFile.emplace();
+              if (!mConfigFile->load()) {
+                  self.getLogger().warn("Failed to load typed config");
+                  return false;
+              }
+              mConfig = mConfigFile->value();
+              applyConfig(mConfig);
+
+              self.getLogger().info("Loaded {} from {}", self.getName(), self.getModDir().string());
+              return true;
+          }
+
+          bool ClangeMeMod::enable() {
+              auto &self = getSelf();
+              self.getLogger().debug("Enabling...");
+
+              // ---- In-game menu ----
+              if (guardTripped("menu.pending")) {
+                  self.getLogger().warn("The menu crashed the game last time; skipping it. Delete menu.pending in the data folder to retry.");
+              } else {
+                  guardSet("menu.pending");
+
+                  const std::string hitVolume = std::to_string(mConfig.hitVolume);
+                  const std::string muffle = std::to_string(mConfig.muffleAmount);
+                  const std::string sharpen = std::to_string(mConfig.sharpenAmount);
+
+                  const bool menuOk =
+                      withConfigCallback(
+                          pl::modmenu::ModuleBuilder(kModuleId, "Better Hitreg")
+                              .modId(self.getId())
+                              .description("Instant hit feedback. Tune it here.")
+                              .defaultEnabled(mConfig.enabled)
+                              .onToggle(onModuleToggle)
+                              .config("hitSound", "Instant hit sound (in development)",
+                                      pl::modmenu::ConfigType::Toggle, mConfig.hitSound ? "true" : "false")
+                              .config("hitFlash", "Instant hit flash (in development)",
+                                      pl::modmenu::ConfigType::Toggle, mConfig.hitFlash ? "true" : "false")
+                              .config("hitVolume", "Hit volume", pl::modmenu::ConfigType::SliderInt,
+                                      hitVolume.c_str(), "0", "100")
+                              .config("muffleAmount", "Muffle amount", pl::modmenu::ConfigType::SliderInt,
+                                      muffle.c_str(), "0", "100")
+                              .config("sharpenAmount", "Sharpen amount", pl::modmenu::ConfigType::SliderInt,
+                                      sharpen.c_str(), "0", "100"))
+                          .registerModule();
+
+                  guardClear("menu.pending");
+                  if (!menuOk)
+                      self.getLogger().warn("Could not register the Better Hitreg menu module");
+              }
+
+              // ---- Hook ----
+              if (guardTripped("attack_hook.pending")) {
+                  self.getLogger().warn("The attack hook crashed the game last time; skipping it. Delete attack_hook.pending to retry.");
+                  return true;
+              }
+              uintptr_t target = resolveAttackTarget();
+              if (target == 0)
+                  return true; // already logged; the mod stays idle
+
+              if (!targetLooksValid(target)) {
+                  self.getLogger().warn("Bytes at the attack target do not match 1.26.62.1; hook skipped to avoid a crash.");
+                  return true;
+              }
+
+              mAttackHook = pl::memory::HookHandle(reinterpret_cast<void *>(target),
+                                                   reinterpret_cast<void *>(&attackDetour),
+                                                   reinterpret_cast<void **>(&gOriginal),
+                                                   pl::memory::HookPriority::Normal);
+              if (!mAttackHook.installed()) {
+                  self.getLogger().error("Failed to install attack hook");
+                  return true;
+              }
+              self.getLogger().info("Attack hook installed at 0x{:x}", target);
+              writeCalibrationFile(true);
+
+              // Log-only sound sampler (pass-through).
+              if (mConfig.soundSampler && !guardTripped("sound_hook.pending")) {
+                  uintptr_t base = moduleBase("libminecraftpe.so");
+                  if (base != 0) {
+                      const auto *w = reinterpret_cast<const uint32_t *>(base + kRvaSoundPlay);
+                      if (w[0] == kSoundWord0 && w[1] == kSoundWord1) {
+                          mSoundHook = pl::memory::HookHandle(reinterpret_cast<void *>(base + kRvaSoundPlay),
+                                                              reinterpret_cast<void *>(&soundDetour),
+                                                              reinterpret_cast<void **>(&gSoundOriginal),
+                                                              pl::memory::HookPriority::Normal);
+                          if (mSoundHook.installed())
+                              self.getLogger().info("Sound sampler installed");
+                      } else {
+                          self.getLogger().warn("Sound sampler skipped: bytes do not match 1.26.62.1");
+                      }
+                  }
+              }
+              return true;
+          }
+
+          bool ClangeMeMod::disable() {
+              getSelf().getLogger().debug("Disabling...");
+              mAttackHook.reset();
+              mSoundHook.reset();
+              pl::modmenu::unregisterModule(kModuleId);
+              return true;
+          }
+
+          bool ClangeMeMod::unload() {
+              getSelf().getLogger().debug("Unloading...");
+              mConfigFile.reset();
+              return true;
+          }
+
+          } // namespace clange_me
+          SRCEOF
+
+      - name: Install NDK and Ninja
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-28" "ndk;28.2.13676358"
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Build packages
+        shell: pwsh
+        run: ./scripts/package.ps1 -Abi arm64-v8a
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: better-hitreg
+          path: build-*/*.levipack
